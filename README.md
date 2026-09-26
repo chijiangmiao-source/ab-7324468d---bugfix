@@ -88,10 +88,12 @@ curl http://127.0.0.1:9090/healthz
 
 - `seal` 服务：数据持久化在命名卷 `seal-data`（容器内 `/data/seal.db`），
   自带健康检查。
-- `verify` 服务：等待 `seal` 健康后执行 `scripts/verify.py`——健康/构建
-  冒烟、组建组、门限不足拒绝、篡改签名拒绝、有效首包（摘要/序号/唯一链头
-  校验）、幂等重传、`op_id` 冲突、8 路并发分叉（恰好一个赢家）——全部
-  通过退出 0，否则退出 1。
+- `verify` 服务：等待 `seal` 健康后执行 `scripts/verify.py`——先运行代码级
+  pytest 套件，再通过真实 HTTP 完成健康/构建冒烟、组建组、门限不足拒绝、篡改
+  签名拒绝、有效首包（摘要/序号/唯一链头校验）、幂等重传、`op_id` 冲突、
+  **顺序**同前序竞争（409 且不写包/回执）、8 路并发分叉（恰好一个赢家）、
+  失败方 `op_id` 未被回执占用、以及**挂载同一持久化卷的全新服务进程重启**后的
+  唯一链头/线性包列表/正常续包/旧前序仍拒绝——全部通过退出 0，否则退出 1。
 
 ### Dockerfile 单独使用
 
@@ -108,7 +110,7 @@ docker run -e SEAL_PORT=8080 -p 8080:8080 -v seal-data:/data lxe-config-seal
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 SEAL_HOST=127.0.0.1 SEAL_PORT=8080 SEAL_DB=./seal.db .venv/bin/python -m app
-.venv/bin/python -m pytest tests/ -q        # 16 项验收测试
+.venv/bin/python -m pytest tests/ -q        # 19 项验收测试
 SEAL_TARGET_PORT=8080 .venv/bin/python scripts/verify.py
 ```
 
@@ -116,8 +118,10 @@ SEAL_TARGET_PORT=8080 .venv/bin/python scripts/verify.py
 
 建组参数校验（数量/重复/非 P-256/门限/重复组）、有效首包与续包的摘要·
 序号·唯一链头、篡改签名、签错字段、重复签署者、未知签署者、门限不足、
-过期前序（重放旧前序与跳号）、幂等重传、`op_id` 冲突、8 线程并发分叉
-（恰好一个确认）、重启后链头恢复并继续续包、HTTP 端到端冒烟。
+过期前序（重放旧前序与跳号）、**顺序同前序竞争（不同 op_id/载荷/签名，
+恰好一个确认，败者不写包与回执）**、幂等重传、`op_id` 冲突、8 线程并发分叉
+（恰好一个确认）、非创世链头的并发+迟到竞争（败者 op_id 可复用）、竞争失败
+后重启链头/包列表一致且可继续续包、重启后链头恢复并继续续包、HTTP 端到端冒烟。
 
 ## 布局
 

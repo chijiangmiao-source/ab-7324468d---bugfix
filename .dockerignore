@@ -7,5 +7,3 @@ __pycache__/
 *.db-wal
 *.db-shm
 .pytest_cache/
-tests/
-conftest.py

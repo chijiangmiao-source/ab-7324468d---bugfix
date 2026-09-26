@@ -226,6 +226,66 @@ def test_stale_predecessor_rejected(store, group):
     assert service.get_group(store, gid)[1]["head"] == {"seq": 1, "digest": p1["digest"]}
 
 
+def test_sequential_competing_first_packages(store, group):
+    """A consumed predecessor cannot be extended a second time.
+
+    Two fully valid packages (different op_id, different config, own
+    sufficient signatures) compete for genesis/seq=1 and arrive in strict
+    sequence: exactly one confirms; the other gets 409 stale_predecessor
+    and writes neither a package nor a receipt, and the head is unmoved.
+    """
+    gid, keys = group
+    status, p1 = _submit(store, gid, keys, "op-A", GENESIS, 1, "config-A")
+    assert status == 201
+
+    with pytest.raises(ApiError) as e:
+        _submit(store, gid, keys, "op-B", GENESIS, 1, "config-B")
+    assert _err(e) == (409, "stale_predecessor")
+
+    assert service.get_group(store, gid)[1]["head"] == {
+        "seq": 1, "digest": p1["digest"],
+    }
+    listing = service.list_packages(store, gid)[1]["packages"]
+    assert [(p["seq"], p["op_id"], p["digest"]) for p in listing] == [
+        (1, "op-A", p1["digest"]),
+    ]
+    # the loser left no receipt: reusing its op_id against the real head is
+    # a fresh confirmation, not an op_id conflict or replay
+    status, p2 = _submit(store, gid, keys, "op-B", p1["digest"], 2, "config-B")
+    assert status == 201 and p2["seq"] == 2 and p2["replay"] is False
+    assert service.get_group(store, gid)[1]["head"] == {
+        "seq": 2, "digest": p2["digest"],
+    }
+
+
+def test_rejected_competitor_survives_restart(tmp_path, store, group):
+    """After a rejected fork and a restart the unique chain is unchanged."""
+    gid, keys = group
+    _, p1 = _submit(store, gid, keys, "op-1", GENESIS, 1, "a")
+    with pytest.raises(ApiError) as e:
+        _submit(store, gid, keys, "op-2", GENESIS, 1, "fork")
+    assert _err(e) == (409, "stale_predecessor")
+    _, p2 = _submit(store, gid, keys, "op-3", p1["digest"], 2, "b")
+    store.close()
+
+    reopened = Store(str(tmp_path / "seal.db"))
+    try:
+        _, info = service.get_group(reopened, gid)
+        assert info["head"] == {"seq": 2, "digest": p2["digest"]}
+        chain = service.list_packages(reopened, gid)[1]["packages"]
+        assert [p["seq"] for p in chain] == [1, 2]
+        assert chain[1]["prev_digest"] == p1["digest"]
+        # the recovered head is exactly once-extendable; a replayed old
+        # predecessor stays rejected after restart
+        with pytest.raises(ApiError) as e:
+            _submit(reopened, gid, keys, "op-old", GENESIS, 1, "old")
+        assert _err(e) == (409, "stale_predecessor")
+        status, p3 = _submit(reopened, gid, keys, "op-4", p2["digest"], 3, "c")
+        assert status == 201 and p3["seq"] == 3
+    finally:
+        reopened.close()
+
+
 # --------------------------------------------------------------------------
 # idempotency
 # --------------------------------------------------------------------------
@@ -284,6 +344,57 @@ def test_concurrent_fork_exactly_one_winner(store, group):
     winner = results[0][1]
     assert service.get_group(store, gid)[1]["head"] == {"seq": 1, "digest": winner["digest"]}
     assert len(service.list_packages(store, gid)[1]["packages"]) == 1
+
+
+def test_concurrent_fork_after_head_and_latecomer(store, group):
+    """The same predecessor cannot be raced twice: concurrent + sequential.
+
+    8 packages race for seq=2 off the confirmed seq=1 head: exactly one
+    wins, all others are stale and write nothing; a ninth valid package
+    aimed at the same consumed predecessor arriving strictly afterwards
+    loses as well, while a proper continuation off the new head succeeds.
+    """
+    gid, keys = group
+    _, p1 = _submit(store, gid, keys, "op-1", GENESIS, 1, "cfg-0")
+
+    results, errors = [], []
+
+    def attempt(i):
+        try:
+            results.append(_submit(store, gid, keys, f"op-race-{i}",
+                                   p1["digest"], 2, f"cfg-{i}"))
+        except ApiError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=attempt, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(results) == 1
+    assert len(errors) == 7 and all(e.code == "stale_predecessor" for e in errors)
+    winner = results[0][1]
+
+    # strictly-late competitor for the same (already consumed) predecessor
+    with pytest.raises(ApiError) as e:
+        _submit(store, gid, keys, "op-late", p1["digest"], 2, "cfg-late")
+    assert _err(e) == (409, "stale_predecessor")
+
+    assert service.get_group(store, gid)[1]["head"] == {
+        "seq": 2, "digest": winner["digest"],
+    }
+    chain = service.list_packages(store, gid)[1]["packages"]
+    assert [p["seq"] for p in chain] == [1, 2]
+    assert chain[1]["prev_digest"] == p1["digest"]
+    assert chain[1]["digest"] == winner["digest"]
+
+    # only the two winners carry receipts; losers' op_ids were not consumed
+    status, p3 = _submit(store, gid, keys, "op-late", winner["digest"], 3, "cfg-next")
+    assert status == 201 and p3["seq"] == 3
+    assert service.get_group(store, gid)[1]["head"] == {
+        "seq": 3, "digest": p3["digest"],
+    }
 
 
 # --------------------------------------------------------------------------

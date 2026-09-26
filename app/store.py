@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS packages (
     config      TEXT NOT NULL,
     signers     TEXT NOT NULL,          -- JSON array of signer key ids
     created_at  TEXT NOT NULL,
-    PRIMARY KEY (group_id, seq, digest),
+    PRIMARY KEY (group_id, seq),        -- one confirmed package per seq: a
+                                        -- consumed predecessor cannot fork
     UNIQUE (group_id, digest)
 );
 CREATE TABLE IF NOT EXISTS receipts (
@@ -95,7 +96,11 @@ class Store:
         """Derive every group's unique chain head from confirmed packages.
 
         Runs on every startup: after a restart the chain head is recovered
-        from the durable package records, never from stale side state.
+        from the durable package records, never from stale side state. The
+        packages table can hold at most one package per seq and the chain
+        must be linear (1..N, each prev_digest chaining to the previous
+        digest); a corrupt fork is a fatal integrity error rather than an
+        ambiguously chosen head.
         """
         self._conn.execute("BEGIN IMMEDIATE")
         try:
@@ -103,19 +108,27 @@ class Store:
                 r["group_id"] for r in self._conn.execute("SELECT group_id FROM groups")
             ]
             for gid in group_ids:
-                row = self._conn.execute(
-                    "SELECT seq, digest FROM packages WHERE group_id=?"
-                    " ORDER BY seq DESC LIMIT 1",
+                rows = self._conn.execute(
+                    "SELECT seq, digest, prev_digest FROM packages"
+                    " WHERE group_id=? ORDER BY seq",
                     (gid,),
-                ).fetchone()
-                seq, digest = (row["seq"], row["digest"]) if row else (0, GENESIS_DIGEST)
+                ).fetchall()
+                seq, digest = 0, GENESIS_DIGEST
+                prev = GENESIS_DIGEST
+                for row in rows:
+                    if row["seq"] != seq + 1 or row["prev_digest"] != prev:
+                        raise RuntimeError(
+                            f"chain integrity violation for group {gid!r} at seq "
+                            f"{row['seq']}: history is not a single linear chain"
+                        )
+                    seq, digest, prev = row["seq"], row["digest"], row["digest"]
                 self._conn.execute(
                     "INSERT INTO heads (group_id, head_seq, head_digest) VALUES (?,?,?)"
                     " ON CONFLICT(group_id) DO UPDATE SET"
                     " head_seq=excluded.head_seq, head_digest=excluded.head_digest",
                     (gid, seq, digest),
                 )
-                if row:
+                if rows:
                     log.info(
                         "recovered chain head: group=%s seq=%d digest=%s…",
                         gid, seq, digest[:16],
@@ -235,16 +248,19 @@ class Store:
                 if receipt is not None:
                     outcome = ("receipt", receipt)
                 else:
-                    if prev_digest == GENESIS_DIGEST:
-                        predecessor_seq = 0
-                    else:
-                        predecessor = self._conn.execute(
-                            "SELECT seq FROM packages WHERE group_id=? AND digest=?",
-                            (group_id, prev_digest),
-                        ).fetchone()
-                        predecessor_seq = predecessor["seq"] if predecessor else None
-
-                    if predecessor_seq is None or seq != predecessor_seq + 1:
+                    # The package must extend the *currently confirmed* head,
+                    # not merely reference some package that once existed:
+                    # a predecessor already consumed by a later package can
+                    # never be extended again.
+                    head = self._conn.execute(
+                        "SELECT head_seq, head_digest FROM heads WHERE group_id=?",
+                        (group_id,),
+                    ).fetchone()
+                    if (
+                        head is None
+                        or seq != head["head_seq"] + 1
+                        or prev_digest != head["head_digest"]
+                    ):
                         outcome = ("stale",)
                     else:
                         self._conn.execute(
@@ -257,15 +273,21 @@ class Store:
                             ),
                         )
                         self._conn.execute(
-                            "UPDATE heads SET head_seq=?, head_digest=?"
-                            " WHERE group_id=? AND head_seq <= ?",
-                            (seq, digest, group_id, seq),
-                        )
-                        self._conn.execute(
                             "INSERT INTO receipts (group_id, op_id, request_hash,"
                             " response_json, created_at) VALUES (?,?,?,?,?)",
                             (group_id, op_id, request_hash, json.dumps(response), _now()),
                         )
+                        # Conditional head move: only the transaction that
+                        # observed this exact head may advance it. Any
+                        # concurrent committer loses even if the unique
+                        # constraints above did not fire.
+                        moved = self._conn.execute(
+                            "UPDATE heads SET head_seq=?, head_digest=?"
+                            " WHERE group_id=? AND head_seq=? AND head_digest=?",
+                            (seq, digest, group_id, head["head_seq"], head["head_digest"]),
+                        ).rowcount
+                        if moved != 1:
+                            raise RaceLost()
                         outcome = ("ok",)
                 self._conn.execute("COMMIT")
             except sqlite3.IntegrityError as exc:

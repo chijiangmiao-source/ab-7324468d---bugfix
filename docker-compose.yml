@@ -33,6 +33,15 @@ services:
     environment:
       SEAL_TARGET_HOST: seal
       SEAL_TARGET_PORT: "8080"
+      SEAL_DB: /data/seal.db
+    volumes:
+      # Same persisted database as seal: lets the verifier cross-check the
+      # recovered head/history directly.
+      - seal-data:/data
+      # Used only to start a fresh recovery container attached to the same
+      # named volume (service-restart persistence check); the verifier then
+      # removes it.
+      - /var/run/docker.sock:/var/run/docker.sock
     command: ["python", "scripts/verify.py"]
     restart: "no"
 
