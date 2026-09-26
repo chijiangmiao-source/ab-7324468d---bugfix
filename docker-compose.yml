@@ -1,0 +1,40 @@
+name: lxe-config-seal
+
+# One-shot acceptance run:
+#   docker compose up --build --exit-code-from verify --abort-on-container-exit
+# The compose project exit code is the verify container's exit code.
+#
+# Host port is configurable:  SEAL_HOST_PORT=9090 docker compose up seal
+services:
+  seal:
+    build: .
+    image: lxe-config-seal:latest
+    environment:
+      SEAL_PORT: "8080"
+      SEAL_DB: /data/seal.db
+    ports:
+      - "${SEAL_HOST_PORT:-8080}:8080"
+    volumes:
+      - seal-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('SEAL_PORT','8080')+'/healthz',timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  verify:
+    image: lxe-config-seal:latest
+    build: .
+    depends_on:
+      seal:
+        condition: service_healthy
+    environment:
+      SEAL_TARGET_HOST: seal
+      SEAL_TARGET_PORT: "8080"
+    command: ["python", "scripts/verify.py"]
+    restart: "no"
+
+volumes:
+  seal-data:
