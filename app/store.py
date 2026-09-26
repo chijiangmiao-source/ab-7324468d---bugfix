@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS packages (
     signers     TEXT NOT NULL,          -- JSON array of signer key ids
     created_at  TEXT NOT NULL,
     PRIMARY KEY (group_id, seq, digest),
-    UNIQUE (group_id, digest)
+    UNIQUE (group_id, digest),
+    UNIQUE (group_id, seq)              -- backstop: one package per height
 );
 CREATE TABLE IF NOT EXISTS receipts (
     group_id      TEXT NOT NULL REFERENCES groups(group_id),
@@ -84,18 +85,99 @@ class Store:
         self._lock = threading.RLock()
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._rebuild_heads()
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
 
+    # -- schema migration ---------------------------------------------------
+    def _migrate(self) -> None:
+        """Bring databases written by older schemas up to date.
+
+        The packages table must carry a UNIQUE(group_id, seq) backstop.
+        Databases written before that constraint existed may hold forked
+        rows (same seq, different digest) confirmed by the consumed-
+        predecessor bug; reduce every group to its single canonical chain
+        — walked from genesis, earliest confirmed link wins each step — so
+        the linear head is again uniquely derivable, then add the index.
+        """
+        for row in self._conn.execute("PRAGMA index_list(packages)"):
+            if not row["unique"]:
+                continue
+            cols = [
+                r["name"]
+                for r in self._conn.execute(f'PRAGMA index_info("{row["name"]}")')
+            ]
+            if cols == ["group_id", "seq"]:
+                return  # backstop already in place
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            group_ids = [
+                r["group_id"] for r in self._conn.execute("SELECT group_id FROM groups")
+            ]
+            for gid in group_ids:
+                keep = [rowid for rowid, _, _ in self._canonical_chain(gid)]
+                stale = self._conn.execute(
+                    "SELECT rowid, op_id FROM packages WHERE group_id=?"
+                    + (f" AND rowid NOT IN ({','.join('?' * len(keep))})" if keep else ""),
+                    (gid, *keep),
+                ).fetchall()
+                if not stale:
+                    continue
+                log.warning(
+                    "pruning %d forked package(s) from group %s;"
+                    " keeping the unique canonical chain",
+                    len(stale), gid,
+                )
+                self._conn.executemany(
+                    "DELETE FROM receipts WHERE group_id=? AND op_id=?",
+                    [(gid, r["op_id"]) for r in stale],
+                )
+                self._conn.executemany(
+                    "DELETE FROM packages WHERE rowid=?",
+                    [(r["rowid"],) for r in stale],
+                )
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS packages_group_seq"
+                " ON packages(group_id, seq)"
+            )
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def _canonical_chain(self, group_id: str) -> list[tuple[int, int, str]]:
+        """(rowid, seq, digest) links of the unique chain from genesis.
+
+        Each step follows the one package whose prev_digest matches the
+        current link; if historical data ever held competitors for a step,
+        the earliest confirmed (lowest rowid) wins, so the result is always
+        deterministic and uniquely derivable from the durable records.
+        """
+        chain: list[tuple[int, int, str]] = []
+        seq, digest = 0, GENESIS_DIGEST
+        while True:
+            row = self._conn.execute(
+                "SELECT rowid, digest FROM packages"
+                " WHERE group_id=? AND seq=? AND prev_digest=?"
+                " ORDER BY rowid LIMIT 1",
+                (group_id, seq + 1, digest),
+            ).fetchone()
+            if row is None:
+                return chain
+            seq += 1
+            digest = row["digest"]
+            chain.append((row["rowid"], seq, digest))
+
     # -- recovery ---------------------------------------------------------
     def _rebuild_heads(self) -> None:
         """Derive every group's unique chain head from confirmed packages.
 
         Runs on every startup: after a restart the chain head is recovered
-        from the durable package records, never from stale side state.
+        by walking the single linear chain from genesis through the durable
+        package records, never from stale side state.
         """
         self._conn.execute("BEGIN IMMEDIATE")
         try:
@@ -103,19 +185,15 @@ class Store:
                 r["group_id"] for r in self._conn.execute("SELECT group_id FROM groups")
             ]
             for gid in group_ids:
-                row = self._conn.execute(
-                    "SELECT seq, digest FROM packages WHERE group_id=?"
-                    " ORDER BY seq DESC LIMIT 1",
-                    (gid,),
-                ).fetchone()
-                seq, digest = (row["seq"], row["digest"]) if row else (0, GENESIS_DIGEST)
+                chain = self._canonical_chain(gid)
+                seq, digest = chain[-1][1:] if chain else (0, GENESIS_DIGEST)
                 self._conn.execute(
                     "INSERT INTO heads (group_id, head_seq, head_digest) VALUES (?,?,?)"
                     " ON CONFLICT(group_id) DO UPDATE SET"
                     " head_seq=excluded.head_seq, head_digest=excluded.head_digest",
                     (gid, seq, digest),
                 )
-                if row:
+                if chain:
                     log.info(
                         "recovered chain head: group=%s seq=%d digest=%s…",
                         gid, seq, digest[:16],
@@ -235,16 +313,19 @@ class Store:
                 if receipt is not None:
                     outcome = ("receipt", receipt)
                 else:
-                    if prev_digest == GENESIS_DIGEST:
-                        predecessor_seq = 0
-                    else:
-                        predecessor = self._conn.execute(
-                            "SELECT seq FROM packages WHERE group_id=? AND digest=?",
-                            (group_id, prev_digest),
-                        ).fetchone()
-                        predecessor_seq = predecessor["seq"] if predecessor else None
-
-                    if predecessor_seq is None or seq != predecessor_seq + 1:
+                    # The predecessor must be the *current* confirmed head:
+                    # a predecessor that was already consumed (genesis after
+                    # the first package, or any older link) can never be
+                    # extended again, so no fork is ever written.
+                    head = self._conn.execute(
+                        "SELECT head_seq, head_digest FROM heads WHERE group_id=?",
+                        (group_id,),
+                    ).fetchone()
+                    if (
+                        head is None
+                        or head["head_digest"] != prev_digest
+                        or seq != head["head_seq"] + 1
+                    ):
                         outcome = ("stale",)
                     else:
                         self._conn.execute(
@@ -256,11 +337,16 @@ class Store:
                                 json.dumps(signer_ids), _now(),
                             ),
                         )
-                        self._conn.execute(
+                        moved = self._conn.execute(
                             "UPDATE heads SET head_seq=?, head_digest=?"
-                            " WHERE group_id=? AND head_seq <= ?",
-                            (seq, digest, group_id, seq),
+                            " WHERE group_id=? AND head_seq=? AND head_digest=?",
+                            (
+                                seq, digest, group_id,
+                                head["head_seq"], head["head_digest"],
+                            ),
                         )
+                        if moved.rowcount != 1:
+                            raise RaceLost()
                         self._conn.execute(
                             "INSERT INTO receipts (group_id, op_id, request_hash,"
                             " response_json, created_at) VALUES (?,?,?,?,?)",

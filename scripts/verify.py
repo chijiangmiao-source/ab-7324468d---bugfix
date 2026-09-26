@@ -8,7 +8,8 @@ Runs entirely over HTTP against a running seal server:
   2. valid first package: digest/seq/unique head are exactly as expected
   3. idempotent retransmission replays the same receipt, creates no history
   4. same op_id with a changed payload conflicts (409)
-  5. concurrent submissions racing for the same predecessor: exactly one wins
+  5. a consumed predecessor can never be extended again (409, no history)
+  6. concurrent submissions racing for the same predecessor: exactly one wins
 
 Exits 0 only if every check passes.
 """
@@ -158,7 +159,26 @@ def main() -> int:
           status == 409 and err.get("error") == "op_id_conflict",
           f"status={status} err={err}")
 
-    # -- 5. concurrent race for the same predecessor ------------------------
+    # -- 5. consumed predecessor can never be extended again ----------------
+    # The reported fork: different op_id, different config, fully valid
+    # threshold signatures — but genesis/seq 1 was already consumed by the
+    # first package, so this must be a 409 and write nothing.
+    fork1 = package_body(keys, gid, "op-fork-1", crypto.GENESIS_DIGEST, 1,
+                         "field=4500V", (0, 1))
+    status, err = call("POST", f"/v1/groups/{gid}/packages", fork1)
+    check("consumed genesis predecessor rejected",
+          status == 409 and err.get("error") == "stale_predecessor",
+          f"status={status} err={err}")
+    status, listing = call("GET", f"/v1/groups/{gid}/packages")
+    check("fork attempt wrote no package, receipt or head move",
+          len(listing["packages"]) == 1
+          and listing["packages"][0]["digest"] == expected1,
+          f"packages={[(p['seq'], p['digest'][:12]) for p in listing['packages']]}")
+    status, info = call("GET", f"/v1/groups/{gid}")
+    check("chain head still uniquely package 1",
+          info["head"] == {"seq": 1, "digest": expected1}, f"head={info.get('head')}")
+
+    # -- 6. concurrent race for the same predecessor ------------------------
     race_results: list[tuple[int, dict]] = []
     lock = threading.Lock()
 
@@ -199,7 +219,8 @@ def main() -> int:
     if _failures:
         print(f"VERIFY FAILED ({len(_failures)} check(s)): {', '.join(_failures)}")
         return 1
-    print("VERIFY PASSED: all threshold/idempotency/chain-head checks OK")
+    print("VERIFY PASSED: all threshold/idempotency/consumed-predecessor/"
+          "chain-head checks OK")
     return 0
 
 

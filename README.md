@@ -71,6 +71,9 @@ DOMAIN_SEPARATOR("LXe-ConfigSeal/v1") || 0x00
   才留下回执，校验失败的尝试不会占用 `op_id`。
 - 重启后服务从 `packages` 表中已确认记录**重建唯一链头**
   （日志输出 `recovered chain head: …`），随后即可继续续包。
+- 打开缺少 `UNIQUE(group_id, seq)` 兜底约束的旧库时，服务会先把每个组
+  裁剪为自创世起逐步链接的**唯一规范链**（同序竞争取最早确认者），
+  清除分叉包及其回执并补上唯一索引，再恢复链头。
 
 ## 运行
 
@@ -90,8 +93,8 @@ curl http://127.0.0.1:9090/healthz
   自带健康检查。
 - `verify` 服务：等待 `seal` 健康后执行 `scripts/verify.py`——健康/构建
   冒烟、组建组、门限不足拒绝、篡改签名拒绝、有效首包（摘要/序号/唯一链头
-  校验）、幂等重传、`op_id` 冲突、8 路并发分叉（恰好一个赢家）——全部
-  通过退出 0，否则退出 1。
+  校验）、幂等重传、`op_id` 冲突、已消费创世前序的顺序分叉拒绝（409 且
+  不写历史）、8 路并发分叉（恰好一个赢家）——全部通过退出 0，否则退出 1。
 
 ### Dockerfile 单独使用
 
@@ -108,7 +111,7 @@ docker run -e SEAL_PORT=8080 -p 8080:8080 -v seal-data:/data lxe-config-seal
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 SEAL_HOST=127.0.0.1 SEAL_PORT=8080 SEAL_DB=./seal.db .venv/bin/python -m app
-.venv/bin/python -m pytest tests/ -q        # 16 项验收测试
+.venv/bin/python -m pytest tests/ -q        # 21 项验收测试
 SEAL_TARGET_PORT=8080 .venv/bin/python scripts/verify.py
 ```
 
@@ -116,8 +119,10 @@ SEAL_TARGET_PORT=8080 .venv/bin/python scripts/verify.py
 
 建组参数校验（数量/重复/非 P-256/门限/重复组）、有效首包与续包的摘要·
 序号·唯一链头、篡改签名、签错字段、重复签署者、未知签署者、门限不足、
-过期前序（重放旧前序与跳号）、幂等重传、`op_id` 冲突、8 线程并发分叉
-（恰好一个确认）、重启后链头恢复并继续续包、HTTP 端到端冒烟。
+过期前序（重放旧前序与跳号）、已消费前序的顺序分叉（创世前序与链中
+前序均拒绝且不改历史）、幂等重传、`op_id` 冲突、8 线程并发分叉（恰好
+一个确认）、重启后链头恢复并继续续包、分叉尝试后重启仍保持唯一链头、
+旧库分叉记录迁移裁剪为唯一规范链、HTTP 端到端冒烟与 HTTP 重启恢复。
 
 ## 布局
 
